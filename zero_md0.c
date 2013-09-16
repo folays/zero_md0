@@ -45,7 +45,7 @@
  */
 
 /*
- * XXX : you NEED to check that nr_request is sufficiently sized for MY_AIO_FLIGHT_MAX,
+ * XXX : you NEED to check that nr_request is sufficiently sized for maxinflight,
  * otherwise io_submit() would block. Not bad for a dumb test, but still not clean.
  */
 
@@ -55,11 +55,13 @@ static int mode_rnd = 0; /* 0 => sequential, 1 => random */
 static unsigned long long int mydevsize; /* size of the block device in bytes */
 static int myiosize = 0; /* optimal_io_size */
 static unsigned long long int mycount = 10000; /* number of i/o to do */
-static int MY_AIO_FLIGHT_MAX = 200;
-static int MY_AIO_SUBMIT_MAX = 10;
 static int copied; /* # of aios dones */
 static int inflight; /* # of aios in flight */
-double variance = 0;
+static int maxinflight = 200; /* maximum # of aios in flight */
+static int maxsubmit = 10; /* maximum # of aios to submit */
+
+struct timeval tv_temp;
+static int copied_temp = 0;
 
 /* Fatal error handler */
 static void io_error(const char *func, int rc)
@@ -76,12 +78,14 @@ static void io_error(const char *func, int rc)
  * XXX : wtf after 2 Go fail, at least res2... something is going on
  * with those two long res/res2 while is iocb contains long long...
  */
+
 static void io_done(io_context_t ctx, struct iocb *iocb, long res, long res2)
 {
+  struct timeval tv_now;
+  double elapsed, avgbw;
+
   if (res2 != 0)
-  {
     io_error("aio ", res2);
-  }
 
   if (res != iocb->u.c.nbytes)
   {
@@ -92,22 +96,21 @@ static void io_done(io_context_t ctx, struct iocb *iocb, long res, long res2)
   --inflight;
   ++copied;
   free(iocb);
-  /* printf("done at off %lld\n", iocb->u.c.offset); */
-  /* printf("done copy : inflight [%d/%d] copied [%d/%d]\n", */
-  /* 	 inflight, MY_AIO_FLIGHT_MAX, copied, mytocpy); */
-}
 
-void loop_write(int fd, void *buf)
-{
-  int i ;
+  /* stats */
+  gettimeofday(&tv_now, NULL);
+  elapsed = (tv_now.tv_sec - tv_temp.tv_sec) * 1000 + (tv_now.tv_usec - tv_temp.tv_usec) / 1000;
+  avgbw = (double)myiosize * copied / elapsed * 1000 / (1024 * 1024);
+  printf("debug: ms=%lfms bw=%lf\n", elapsed, avgbw);
+  /* memcpy(&tv_temp, &tv_now, sizeof(tv_temp));
+  copied_temp = copied; */
 
-  for (i = 0; i < 1000000; ++i)
-  {
-    int nbytes = write(fd, buf, myiosize);
-    if (nbytes != myiosize)
-      printf("%d bytes written\n", nbytes);
-    /* printf("time %ld\n", time(NULL)); */
-  }
+  if (copied % 100 == 0)
+    printf("done copy: inflight [%d/%d] copied [%d/%llu]\n",
+      inflight, maxinflight, copied, mycount);
+
+  if (inflight == 0 && copied < mycount)
+    printf("warning: buffer underrun (0 inflight i/o)\n");
 }
 
 void loop_aio(int fd, void *buf)
@@ -118,14 +121,15 @@ void loop_aio(int fd, void *buf)
   /* i/o context initialization */
   io_context_t myctx;
   memset(&myctx, 0, sizeof(myctx));
-  if ((res = io_queue_init(MY_AIO_FLIGHT_MAX, &myctx)))
+  if ((res = io_queue_init(maxinflight, &myctx)))
     io_error("io_queue_init", res);
 
   gettimeofday(&tv_start, NULL);
+  memcpy(&tv_temp, &tv_start, sizeof(tv_temp));
 
   while (copied < mycount)
   {
-    struct iocb *ioq[MY_AIO_SUBMIT_MAX];
+    struct iocb *ioq[maxsubmit];
     int tosubmit = 0;
     unsigned long long int index;
     struct iocb *iocb;
@@ -134,15 +138,15 @@ void loop_aio(int fd, void *buf)
 
     /* filling a context with io queries */
     while (copied + inflight + tosubmit < mycount &&
-      inflight + tosubmit < MY_AIO_FLIGHT_MAX &&
-      tosubmit < MY_AIO_SUBMIT_MAX)
+      inflight + tosubmit < maxinflight &&
+      tosubmit < maxsubmit)
     {
       /* Simultaneous asynchronous operations using the same iocb produce undefined results. */
       /*iocb = calloc(1, sizeof(*iocb));*/
-      iocb = malloc(sizeof(*iocb));
+      iocb = malloc(sizeof(struct iocb));
 
       if (mode_rnd)
-	      index = (mydevsize / myiosize) * random() / RAND_MAX;
+        index = (mydevsize / myiosize) * random() / RAND_MAX;
       else
         index = copied + inflight + tosubmit;
 
@@ -156,23 +160,16 @@ void loop_aio(int fd, void *buf)
       tosubmit += 1;
     }
 
-    printf("to_submit: %d\n", tosubmit);
-
     /* if there are available slots for submitting queries, do it */
     if (tosubmit)
     {
-      /* diag */
-      if (rand() % 100 == 0)
-        printf("<- io_submit %03d inflight [%03d/%03d] copied [%d/%lld] ...\n",
-          tosubmit, inflight, MY_AIO_FLIGHT_MAX, copied, mycount);
-
       /* submit io and check elapsed time */
       gettimeofday(&tv1, NULL);
       if ((res = io_submit(myctx, tosubmit, ioq)) != tosubmit)
-	    {
-	      printf("only %d io submitted\n", res);
-	      io_error("io_submit write", res);
-	    }
+      {
+        printf("only %d io submitted\n", res);
+        io_error("io_submit write", res);
+      }
       gettimeofday(&tv2, NULL);
       elapsed = (tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000;
       if (elapsed > 200)
@@ -186,13 +183,9 @@ void loop_aio(int fd, void *buf)
     if ((res = io_queue_run(myctx)) < 0)
       io_error("io_queue_run", res);
 
-    if (inflight == MY_AIO_FLIGHT_MAX ||
+    if (inflight == maxinflight ||
       (inflight && copied + inflight == mycount))
     {
-	  /* printf("wait\n"); */
-	  /* if ((res = io_queue_wait(myctx, NULL)) < 0) */
-	  /*   io_error("io_queue_wait", res); */
-	  /* printf("wait return %d\n", res); */
       struct io_event event;
       if ((res = io_getevents(myctx, 1, 1, &event, NULL)) < 0)
         io_error("io_getevents", res);
@@ -262,16 +255,16 @@ int main_getopt(int argc, char **argv)
         mode_rnd = 1;
         break;
       case 'b':
-        MY_AIO_SUBMIT_MAX = atoi(optarg);
-        if (MY_AIO_SUBMIT_MAX == 0)
+        maxsubmit = atoi(optarg);
+        if (maxsubmit == 0)
         {
           fprintf(stderr, "Invalid maximum io submit: %s\n", optarg);
           return 1;
         }
         break;
       case 'f':
-        MY_AIO_FLIGHT_MAX = atoi(optarg);
-        if (MY_AIO_FLIGHT_MAX == 0)
+        maxinflight = atoi(optarg);
+        if (maxinflight == 0)
         {
           fprintf(stderr, "Invalid maximum inflight io: %s\n", optarg);
           return 1;
@@ -303,6 +296,8 @@ int main(int argc, char **argv)
   CPU_SET(0, &mask);
   sched_setaffinity(0, sizeof(mask), &mask);
 
+  printf("Using device: %s\n", mydev);
+
   //printf("sizeof 8 bytes type : %lu\n", sizeof(long long int));
   /* opening device */
   int fd = open(mydev, O_RDWR | O_DIRECT);
@@ -311,7 +306,7 @@ int main(int argc, char **argv)
 
   /* detecting device size */
   ioctl(fd, BLKGETSIZE64, &mydevsize);
-  printf("device size: %llu\n", mydevsize);
+  printf("Device size: %llu\n", mydevsize);
 
   /* detecting optimal io size */
   if (!myiosize)
@@ -327,10 +322,9 @@ int main(int argc, char **argv)
       printf("Using auto-detected optimal_io_size for %s\n", mydev);
   }
 
-  printf("Using device %s\n", mydev);
-  printf("Performing %s%s test\n", mode_rnd ? "random " : "",  mode_write ? "write" : "read");
-  printf("Will perform %llux %lukB IOs\n", mycount, (long unsigned int)(myiosize / 1024));
-  printf("Maximum IO submit / inflight: %d / %d\n", MY_AIO_SUBMIT_MAX, MY_AIO_FLIGHT_MAX);
+  printf("Performing %s %s test\n", mode_rnd ? "random " : "sequential",  mode_write ? "write" : "read");
+  printf("Will perform %llu x %lukB IOs\n", mycount, (long unsigned int)(myiosize / 1024));
+  printf("Maximum IO submit / inflight: %d / %d\n", maxsubmit, maxinflight);
   //mycount = mydevsize / myiosize;
 
   /* advising kernel of future io pattern */
@@ -339,16 +333,12 @@ int main(int argc, char **argv)
   else
     posix_fadvise(fd, 0, mydevsize, POSIX_FADV_SEQUENTIAL);
 
-  /* mmap'ing */
+  /* initialize a buffer with random data for disk writes */
   void *buf = mmap(NULL, myiosize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (!buf)
     err(1, "mmap");
-
-  /* if ((unsigned long)addr % 512 || (unsigned long)addr % 4096) */
   if ((uintptr_t)buf % 512 || (uintptr_t)buf % 4096)
     errx(1, "mmap is not aligned...");
-
-  /* initialize a buffer with random data for disk writes */
   int i;
   for (i = 0; i < myiosize / sizeof(int); ++i)
     ((int *)buf)[i] = rand();
