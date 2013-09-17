@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=-Wall
-LDFLAGS=-Wall -laio
+CFLAGS=-Wall -O2
+LDFLAGS=-Wall -laio -lm
 
 ZERO_EXE=zero_md0
 ZERO_SRC=zero_md0.c
