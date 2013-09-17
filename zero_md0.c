@@ -37,6 +37,9 @@
 #include <linux/raw.h>
 #include <getopt.h>
 #include <err.h>
+#include <math.h>
+#include <float.h>
+#include "zero_md0.h"
 
 /*
  * http://linux.derkeiler.com/Mailing-Lists/Kernel/2006-11/msg00966.html
@@ -54,11 +57,11 @@ static unsigned int mode_write = 0; /* 0 => read, 1 => write */
 static unsigned int mode_rnd = 0; /* 0 => sequential, 1 => random */
 static unsigned long long int mydevsize; /* size of the block device in bytes */
 static int myiosize = 0; /* io size */
-static unsigned int mycount = 1000; /* number of i/o to do */
+static unsigned int mycount = 100; /* number of i/o to do */
 static unsigned int maxinflight = 200; /* maximum # of aios in flight */
 static unsigned int maxsubmit = 20; /* maximum # of aios to submit */
-static unsigned int myruns = 10; /* number of runs */
-static unsigned int verbose = 0; /* verbose */
+static unsigned int myruns = 100; /* number of runs */
+static unsigned int opt_verbose = 0; /* verbose */
 
 static unsigned int runid; /* # of aios dones */
 static unsigned int copied; /* # of aios dones */
@@ -95,9 +98,11 @@ static void io_done(io_context_t ctx, struct iocb *iocb, long res, long res2)
   ++copied;
   free(iocb);
 
-  if (verbose && copied % 100 == 0)
+/*
+  if (opt_verbose && copied % 100 == 0)
     printf("done copy: inflight [%u/%u] copied [%u/%u]\n",
       inflight, maxinflight, copied, mycount);
+    */
 
   if (inflight == 0 && copied < mycount)
     printf("warning: buffer underrun (0 inflight i/o)\n");
@@ -117,7 +122,8 @@ void loop_aio(int fd, void *buf)
   copied = 0;
   inflight = 0;
 
-  printf("[run %d] start\n", runid);
+  if (opt_verbose)
+    printf("[run %d] start\n", runid);
 
   while (copied < mycount)
   {
@@ -185,25 +191,7 @@ void loop_aio(int fd, void *buf)
     }
   }
 
-  /*gettimeofday(&tv_end, NULL);*/
   io_queue_release(myctx);
-
-  /* calculating statistics */
-  /*
-  int elapsed = (tv_end.tv_sec - tv_start.tv_sec) * 1000 + (tv_end.tv_usec - tv_start.tv_usec) / 1000;
-
-  stat_time += elapsed;
-  */
-
-/*
-  printf("all job done in %d ms\n", elapsed);
-  printf("iop/s: %d\n", (int)((double)mycount / elapsed * 1000));
-  printf("average lantency in ms: %.3f\n", (double)elapsed / mycount);
-  printf("average bandwidth: %.3f MB/s (%.3f Mb/s)\n",
-    (double)myiosize * mycount / elapsed * 1000 / (1024 * 1024),
-    (double)myiosize * mycount / elapsed * 1000 / (1024 * 1024) * 8);
-  printf("total size in MB: %lld\n", (unsigned long long)myiosize * mycount / 1024 / 1024);
-  */
 }
 
 static struct option long_options[] = {
@@ -223,7 +211,7 @@ int main_getopt(int argc, char **argv)
 {
   int c;
 
-  while ((c = getopt_long(argc, argv, "", long_options, NULL)) != -1)
+  while ((c = getopt_long(argc, argv, "d:s:wrc:b:f:n:v", long_options, NULL)) != -1)
   {
     switch (c)
     {
@@ -270,7 +258,7 @@ int main_getopt(int argc, char **argv)
         }
         break;
       case 'v':
-        verbose = 1;
+        opt_verbose += 1;
         break;
       case 'n':
         myruns = atoi(optarg);
@@ -293,12 +281,50 @@ int usage(char *s)
   return 2;
 }
 
+/*
+ * variance-related functions
+ * http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+ */
+
+void init_variance(variance_t *variance)
+{
+  variance->n = 0;
+  variance->mean = 0;
+  variance->m2 = 0;
+}
+
+void update_variance(variance_t *variance, double value)
+{
+  double delta;
+
+  variance->n += 1;
+  delta = value - variance->mean;
+  variance->mean = variance->mean + delta / variance->n;
+  variance->m2 = variance->m2 + delta * (value - variance->mean);
+}
+
+double get_variance(const variance_t *variance)
+{
+  return variance->m2 / (variance->n - 1);
+}
+
+void update_minmax(const double *cur, double *min, double *max)
+{
+    if (*cur < *min)
+      *min = *cur;
+    else if (*cur > *max)
+      *max = *cur;
+}
+
 int main(int argc, char **argv)
 {
   struct timeval tv_start, tv_end;
   unsigned int elapsed;
-  unsigned int stat_time = 0;
-  unsigned int stat_iocount = 0;
+  unsigned int stat_time = 0, stat_iocount = 0;
+  double lat_cur, lat_min = DBL_MAX, lat_max = 0;
+  double bw_cur, bw_min = DBL_MAX, bw_max = 0;
+  double iops_cur, iops_min = DBL_MAX, iops_max = 0;
+  variance_t lat_variance, bw_variance, iops_variance;
 
   if (main_getopt(argc, argv))
     return 1;
@@ -339,8 +365,8 @@ int main(int argc, char **argv)
   printf("Performing %s %s test, %d runs\n",
     mode_rnd ? "random " : "sequential",
     mode_write ? "write" : "read", myruns);
-  printf("Will perform %u x %ukB IOs\n",
-    mycount, myiosize / 1024);
+  printf("Will perform %u x %u x %ukB IOs\n",
+    myruns, mycount, myiosize / 1024);
   printf("Maximum IO submit / inflight: %d / %d\n",
     maxsubmit, maxinflight);
 
@@ -360,6 +386,10 @@ int main(int argc, char **argv)
   for (i = 0; i < myiosize / sizeof(int); ++i)
     ((int *)buf)[i] = rand();
 
+  init_variance(&lat_variance);
+  init_variance(&bw_variance);
+  init_variance(&iops_variance);
+
   /* start X runs and collect stats */
   for (runid = 0; runid < myruns; ++runid)
   {
@@ -369,27 +399,45 @@ int main(int argc, char **argv)
 
     /* update stats */
     elapsed = (tv_end.tv_sec - tv_start.tv_sec) * 1000 + (tv_end.tv_usec - tv_start.tv_usec) / 1000;
+
     stat_time += elapsed;
     stat_iocount += mycount;
 
-    if (verbose)
+    lat_cur = (double)elapsed / mycount;
+    bw_cur = (double)myiosize * mycount / elapsed * 1000 / (1024 * 1024);
+    iops_cur = (double)mycount / elapsed * 1000;
+
+    update_minmax(&lat_cur, &lat_min, &lat_max);
+    update_minmax(&bw_cur, &bw_min, &bw_max);
+    update_minmax(&iops_cur, &iops_min, &iops_max);
+
+    update_variance(&lat_variance, lat_cur);
+    update_variance(&bw_variance, bw_cur);
+    update_variance(&iops_variance, iops_cur);
+
+    if (opt_verbose)
     {
       printf("[run %d] done in %d ms\n", runid, stat_time);
-      printf("[run %d] iop/s: %d\n", runid,
-        (unsigned int)((double)mycount / elapsed * 1000));
-      printf("[run %d] avg latency (ms): %.3lf\n",
-        runid, (double)elapsed / mycount);
+      printf("[run %d] iop/s: %.3lf\n", runid, iops_cur);
+      printf("[run %d] avg bandwidth: %.3lf MB/s\n", runid, bw_cur);
+      printf("[run %d] avg latency: %.3lf ms\n", runid, lat_cur);
     }
   }
 
-  printf("%d io done in %d ms\n", stat_iocount, stat_time);
-  printf("average iop/s: %.2lf\n", (double)stat_iocount / stat_time * 1000);
-  printf("average latency: %.3f ms\n", (double)stat_time / stat_iocount);
-  printf("average bandwidth: %.3f MB/s (%.3f Mb/s)\n",
-    (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024),
-    (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024) * 8);
+  printf("all jobs done in %d ms\n", stat_time);
   printf("total data size: %lld MB\n",
     (unsigned long long)myiosize * stat_iocount / 1024 / 1024);
+  printf("total %s io: %u\n", mode_write ? "write" : "read", stat_iocount);
+  printf("average iop/s: %.2lf (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
+    (double)stat_iocount / stat_time * 1000,
+    iops_min, iops_max, sqrt(get_variance(&iops_variance)));
+  printf("average latency: %.3lf ms (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
+    (double)stat_time / stat_iocount, lat_min, lat_max,
+    sqrt(get_variance(&lat_variance)));
+  printf("average bandwidth: %.3lf MB/s %.3lf Mb/s) (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
+    (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024),
+    (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024) * 8,
+    bw_min, bw_max, sqrt(get_variance(&bw_variance)));
 
   return 0;
 }
