@@ -3,6 +3,9 @@
  * Copyright (c) 2011
  * Eric Gouyer <folays@folays.net>
  *
+ * Contributors
+ * Nicolas Limage
+ *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
@@ -98,11 +101,9 @@ static void io_done(io_context_t ctx, struct iocb *iocb, long res, long res2)
   ++copied;
   free(iocb);
 
-/*
-  if (opt_verbose && copied % 100 == 0)
+  if (opt_verbose > 1 && copied % 100 == 0)
     printf("done copy: inflight [%u/%u] copied [%u/%u]\n",
       inflight, maxinflight, copied, mycount);
-    */
 
   if (inflight == 0 && copied < mycount)
     printf("warning: buffer underrun (0 inflight i/o)\n");
@@ -169,7 +170,7 @@ void loop_aio(int fd, void *buf)
       gettimeofday(&tv2, NULL);
       elapsed = (tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000;
       if (elapsed > 200)
-        printf("\e[33mwarning\e[0m: io_submit() took %d ms, this is suspicious, maybe nr_request is too low.\n", elapsed);
+        printf("warning: io_submit() took %d ms, this is suspicious, maybe nr_request is too low.\n", elapsed);
 
       /* inflight io += newly submitted io */
       inflight += tosubmit;
@@ -276,7 +277,7 @@ int main_getopt(int argc, char **argv)
 int usage(char *s)
 {
   fprintf(stderr, "Usage: %s <--dev=/dev/xxx> [--write] [--random] \
-[--iosize=x (kB)] [--iocount=x] [--runs=x] [--verbose]\
+[--iosize=x (kB)] [--iocount=x] [--runs=x] [--verbose] \
 [--maxsubmit=x] [--maxinflight=x]\n", s);
   return 2;
 }
@@ -306,6 +307,11 @@ void update_variance(variance_t *variance, double value)
 double get_variance(const variance_t *variance)
 {
   return variance->m2 / (variance->n - 1);
+}
+
+double get_stddev(const variance_t *variance)
+{
+  return sqrt(get_variance(variance));
 }
 
 void update_minmax(const double *cur, double *min, double *max)
@@ -430,14 +436,14 @@ int main(int argc, char **argv)
   printf("total %s io: %u\n", mode_write ? "write" : "read", stat_iocount);
   printf("average iop/s: %.2lf (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
     (double)stat_iocount / stat_time * 1000,
-    iops_min, iops_max, sqrt(get_variance(&iops_variance)));
+    iops_min, iops_max, get_stddev(&iops_variance));
   printf("average latency: %.3lf ms (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
     (double)stat_time / stat_iocount, lat_min, lat_max,
-    sqrt(get_variance(&lat_variance)));
+    get_stddev(&lat_variance));
   printf("average bandwidth: %.3lf MB/s %.3lf Mb/s) (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
     (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024),
     (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024) * 8,
-    bw_min, bw_max, sqrt(get_variance(&bw_variance)));
+    bw_min, bw_max, get_stddev(&bw_variance));
 
   return 0;
 }
