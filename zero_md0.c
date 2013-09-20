@@ -3,6 +3,9 @@
  * Copyright (c) 2011
  * Eric Gouyer <folays@folays.net>
  *
+ * Contributors
+ * Nicolas Limage
+ *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
  * copyright notice and this permission notice appear in all copies.
@@ -31,40 +34,41 @@
 #include <sys/mman.h>
 #include <sched.h>
 #include <sys/ioctl.h>
-#include <time.h>
+#include <sys/time.h>
 #include <libaio.h>
 #include <linux/fs.h>
 #include <linux/raw.h>
 #include <getopt.h>
+#include <err.h>
+#include <math.h>
+#include <float.h>
+#include "zero_md0.h"
 
 /*
  * http://linux.derkeiler.com/Mailing-Lists/Kernel/2006-11/msg00966.html
- */
-
-/*
+ *
  * variable secrete : /sys/devices/virtual/block/md0/md/stripe_cache_size
  */
 
-//#define MYDEV "/dev/md2"
-static char *mydev = 0;
-static int mode_write = 0;
-static int mode_rnd = 0;
-
-static unsigned long long int mydevsize; /* size of the block device, in bytes */
-static int myiosize = 0; /* optimal_io_size */
-static unsigned long long int mycount = 10000; /* number of i/o to do */
-
 /*
- * XXX : you NEED to check that nr_request is sufficiently sized for MY_AIO_FLIGHT_MAX,
+ * XXX : you NEED to check that nr_request is sufficiently sized for maxinflight,
  * otherwise io_submit() would block. Not bad for a dumb test, but still not clean.
  */
-//#define MY_AIO_FLIGHT_MAX 200
-//#define MY_AIO_SUBMIT_MAX 10
-static int MY_AIO_FLIGHT_MAX = 200;
-static int MY_AIO_SUBMIT_MAX = 10;
-/* TODO : ok j'ai tout compris pour le sequentiel, il faut tester l'aleatoire maintenant */
-static int copied; /* # of aios dones */
-static int inflight; /* # of aios in flight */
+
+static char *mydev = 0; /* device to be used */
+static unsigned int mode_write = 0; /* 0 => read, 1 => write */
+static unsigned int mode_rnd = 0; /* 0 => sequential, 1 => random */
+static unsigned long long int mydevsize; /* size of the block device in bytes */
+static int myiosize = 0; /* io size */
+static unsigned int mycount = 100; /* number of i/o to do */
+static unsigned int maxinflight = 200; /* maximum # of aios in flight */
+static unsigned int maxsubmit = 20; /* maximum # of aios to submit */
+static unsigned int myruns = 100; /* number of runs */
+static unsigned int opt_verbose = 0; /* verbose */
+
+static unsigned int runid; /* # of aios dones */
+static unsigned int copied; /* # of aios dones */
+static unsigned int inflight; /* # of aios in flight */
 
 /* Fatal error handler */
 static void io_error(const char *func, int rc)
@@ -77,166 +81,130 @@ static void io_error(const char *func, int rc)
   exit(1);
 }
 
-/* XXX : wtf after 2 Go fail, at least res2... something is going on with those two long res/res2 while is iocb contains long long... */
+/*
+ * XXX : wtf after 2 Go fail, at least res2... something is going on
+ * with those two long res/res2 while is iocb contains long long...
+ */
+
 static void io_done(io_context_t ctx, struct iocb *iocb, long res, long res2)
 {
-  if (res2 != 0) {
+  if (res2 != 0)
     io_error("aio ", res2);
-  }
-  if (res != iocb->u.c.nbytes) {
+
+  if (res != iocb->u.c.nbytes)
+  {
     printf("aio missed bytes expect %lu got %ld at off %lld\n", iocb->u.c.nbytes, res2, iocb->u.c.offset);
     exit(1);
   }
+
   --inflight;
   ++copied;
   free(iocb);
-  /* printf("done at off %lld\n", iocb->u.c.offset); */
-  /* printf("done copy : inflight [%d/%d] copied [%d/%d]\n", */
-  /* 	 inflight, MY_AIO_FLIGHT_MAX, copied, mytocpy); */
+
+  if (opt_verbose > 1 && copied % 100 == 0)
+    printf("done copy: inflight [%u/%u] copied [%u/%u]\n",
+      inflight, maxinflight, copied, mycount);
+
+  if (inflight == 0 && copied < mycount)
+    printf("warning: buffer underrun (0 inflight i/o)\n");
 }
 
-int loop_write(int fd, void *addr)
+void loop_aio(int fd, void *buf)
 {
-  int i;
+  int res;
+  unsigned int elapsed;
 
-  for (i = 0; i < 1000000; ++i)
-    {
-      int nbytes = write(fd, addr, myiosize);
-      if (nbytes != myiosize)
-  	printf("%d bytes written\n", nbytes);
-      /* printf("time %ld\n", time(NULL)); */
-    }
-}
-
-void loop_aio(int fd, void *addr)
-{
-  struct timeval tv_start, tv_end;
+  /* i/o context initialization */
   io_context_t myctx;
   memset(&myctx, 0, sizeof(myctx));
-  int res, i;
-
-  gettimeofday(&tv_start, NULL);
-  if (res = io_queue_init(MY_AIO_FLIGHT_MAX, &myctx))
+  if ((res = io_queue_init(maxinflight, &myctx)))
     io_error("io_queue_init", res);
-  //printf("Will initiate %llu io\n", mycount);
+
+  copied = 0;
+  inflight = 0;
+
+  if (opt_verbose)
+    printf("[run %d] start\n", runid);
+
   while (copied < mycount)
+  {
+    struct iocb *ioq[maxsubmit];
+    int tosubmit = 0;
+    unsigned long long int index;
+    struct iocb *iocb;
+    struct timeval tv1, tv2;
+
+    /* filling a context with io queries */
+    while (copied + inflight + tosubmit < mycount &&
+      inflight + tosubmit < maxinflight &&
+      tosubmit < maxsubmit)
     {
-      struct iocb *ioq[MY_AIO_FLIGHT_MAX];
-      int nr = 0;
+      /* Simultaneous asynchronous operations using the same iocb produce undefined results. */
+      iocb = calloc(1, sizeof(struct iocb));
 
-      while (copied + inflight + nr < mycount &&
-	     inflight + nr < MY_AIO_FLIGHT_MAX &&
-	     nr < MY_AIO_SUBMIT_MAX)
-	{
-	  /* Simultaneous asynchronous operations using the same iocb produce undefined results. */
-	  struct iocb *iocb = calloc(1, sizeof(*iocb));
-	  unsigned long long int index = copied + inflight + nr;
-	  if (mode_rnd)
-	    {
-	      /* random io */
-	      index = (mydevsize / myiosize) * random() / RAND_MAX;
-	    }
-	  if (0)
-	    {
-	      /* for raid0+5, align index to the first raid0, and then ensure perfect distribution */
-	      index -= index % 2;
-	      index += (copied + inflight + nr) % 2;
-	    }
-	  /* printf("index : %llu\n", index); */
-	  if (mode_write)
-	    io_prep_pwrite(iocb, fd, addr, myiosize, index * myiosize);
-	  else
-	    io_prep_pread(iocb, fd, addr, myiosize, index * myiosize);
-	  io_set_callback(iocb, io_done);
-	  ioq[nr++] = iocb;
-	}
-      if (nr)
-	{
-	  if (rand() % 100 == 0)
-	    printf("<- io_submit %03d inflight [%03d/%03d] copied [%d/%lld] ...\n",
-		   nr, inflight, MY_AIO_FLIGHT_MAX, copied, mycount);
-	  struct timeval tv1, tv2;
-	  gettimeofday(&tv1, NULL);
-	  if ((res = io_submit(myctx, nr, ioq)) != nr)
-	    {
-	      printf("only %d io submitted\n", res);
-	      io_error("io_submit write", res);
-	    }
-	  gettimeofday(&tv2, NULL);
-	  int elapsed = (tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000;
-	  //	  elapsed = 0;
-	  /* printf("elapsed : %d\n", elapsed); */
-	  if (elapsed > 200)
-	    printf("\e[33mwarning\e[0m: io_submit() took %d ms, this is suspicious, maybe nr_request is too low.\n", elapsed);
-	  inflight += nr;
-	  /* printf("-> scheduled   : inflight [%03d/%03d] copied [%d/%d]\n", */
-	  /* 	 inflight, MY_AIO_FLIGHT_MAX, copied, mycount); */
-	  if (copied + inflight == mycount)
-	    printf("all job scheduled\n");
-	}
-      if ((res = io_queue_run(myctx)) < 0)
-	io_error("io_queue_run", res);
-      if (inflight == MY_AIO_FLIGHT_MAX ||
-	  inflight && copied + inflight == mycount)
-	{
-	  /* printf("wait\n"); */
-	  /* if ((res = io_queue_wait(myctx, NULL)) < 0) */
-	  /*   io_error("io_queue_wait", res); */
-	  /* printf("wait return %d\n", res); */
-	  struct io_event event;
-	  if ((res = io_getevents(myctx, 1, 1, &event, NULL)) < 0)
-	    io_error("io_getevents", res);
-	  if (res != 1)
-	    errx(1, "no events?");
-	  ((io_callback_t)event.obj->data)(myctx, event.obj, event.res, event.res2);
-	}
+      if (mode_rnd)
+        index = (mydevsize / myiosize) * random() / RAND_MAX;
+      else
+        index = copied + inflight + tosubmit;
+
+      if (mode_write)
+        io_prep_pwrite(iocb, fd, buf, myiosize, index * myiosize);
+      else
+        io_prep_pread(iocb, fd, buf, myiosize, index * myiosize);
+
+      io_set_callback(iocb, io_done);
+      ioq[tosubmit] = iocb;
+      tosubmit += 1;
     }
+
+    /* if there are available slots for submitting queries, do it */
+    if (tosubmit)
+    {
+      /* submit io and check elapsed time */
+      gettimeofday(&tv1, NULL);
+      if ((res = io_submit(myctx, tosubmit, ioq)) != tosubmit)
+      {
+        printf("only %d io submitted\n", res);
+        io_error("io_submit write", res);
+      }
+      gettimeofday(&tv2, NULL);
+      elapsed = (tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000;
+      if (elapsed > 200)
+        printf("warning: io_submit() took %d ms, this is suspicious, maybe nr_request is too low.\n", elapsed);
+
+      /* inflight io += newly submitted io */
+      inflight += tosubmit;
+    }
+
+    /* handle completed io events */
+    if ((res = io_queue_run(myctx)) < 0)
+      io_error("io_queue_run", res);
+
+    if (inflight == maxinflight ||
+      (inflight && copied + inflight == mycount))
+    {
+      struct io_event event;
+      if ((res = io_getevents(myctx, 1, 1, &event, NULL)) < 0)
+        io_error("io_getevents", res);
+      if (res != 1)
+        errx(1, "no events?");
+      ((io_callback_t)event.obj->data)(myctx, event.obj, event.res, event.res2);
+    }
+  }
+
   io_queue_release(myctx);
-  gettimeofday(&tv_end, NULL);
-  int elapsed = (tv_end.tv_sec - tv_start.tv_sec) * 1000 + (tv_end.tv_usec - tv_start.tv_usec) / 1000;
-  printf("all job done in %d ms\n", elapsed);
-  printf("iop/s %d\n", (int)((double)mycount / elapsed * 1000));
-  printf("average lantency in ms : %.3f\n", (double)elapsed / mycount);
-  printf("average bandwidth : %.3f MB/s (%.3f Mb/s)\n",
-	 (double)myiosize * mycount / elapsed * 1000 / (1024 * 1024),
-	 (double)myiosize * mycount / elapsed * 1000 / (1024 * 1024) * 8);
-  printf("total size in MB : %lld\n", (unsigned long long)myiosize * mycount / 1024 / 1024);
-}
-
-int get_raw(int fd)
-{
-  struct raw_config_request rq;
-  int ret;
-
-  int fd_rawctl = open("/dev/raw/rawctl", O_RDWR);
-  if (fd_rawctl < 0)
-    err(1, "open /dev/raw/rawctl, please modprobe raw");
-  memset(&rq, '\0', sizeof(rq));
-  rq.raw_minor = 1;
-  ret = ioctl(fd_rawctl, RAW_SETBIND, &rq);
-  if (ret == -1)
-    err(1, "ioctl");
-  struct stat buf;
-  fstat(fd, &buf);
-  printf("blockdev major %d minor %d\n", major(buf.st_rdev), minor(buf.st_rdev));
-  rq.block_major = major(buf.st_rdev);
-  rq.block_minor = minor(buf.st_rdev);
-  ret = ioctl(fd_rawctl, RAW_SETBIND, &rq);
-  if (ret == -1)
-    err(1, "ioctl");
-  close(fd);
-  fd = open("/dev/raw/raw1", O_RDWR | O_DIRECT);
-  return fd;
 }
 
 static struct option long_options[] = {
   {"dev", required_argument, NULL, 'd'},
   {"iosize", required_argument, NULL, 's'},
   {"write", no_argument, NULL, 'w'},
-  {"iocount", required_argument, NULL, 'c'},
   {"random", no_argument, NULL, 'r'},
+  {"iocount", required_argument, NULL, 'c'},
   {"maxsubmit", required_argument, NULL, 'b'},
   {"maxinflight", required_argument, NULL, 'f'},
+  {"runs", required_argument, NULL, 'n'},
+  {"verbose", no_argument, NULL, 'v'},
   {NULL, 0, NULL, 0},
 };
 
@@ -244,131 +212,238 @@ int main_getopt(int argc, char **argv)
 {
   int c;
 
-  while ((c = getopt_long(argc, argv, "", long_options, NULL)) != -1)
+  while ((c = getopt_long(argc, argv, "d:s:wrc:b:f:n:v", long_options, NULL)) != -1)
+  {
+    switch (c)
     {
-      switch (c)
-	{
-	case 'd':
-	  mydev = strdup(optarg);
-	  break;
-	case 's':
-	  myiosize = atoi(optarg);
-	  if (myiosize == 0)
-	    {
-	      fprintf(stderr, "Invalid io size: %s\n", optarg);
-	      return 1;
-	    }
-	  myiosize *= 1024;
-	  break;
-	case 'w':
-	  mode_write = 1;
-	  break;
-	case 'c':
-	  mycount = atoll(optarg);
-	  if (mycount == 0)
-	    {
-	      fprintf(stderr, "Invalid io count: %s\n", optarg);
-	      return 1;
-	    }
-	  break;
-	case 'r':
-	  mode_rnd = 1;
-	  break;
-	case 'b':
-	  MY_AIO_SUBMIT_MAX = atoi(optarg);
-	  if (MY_AIO_SUBMIT_MAX == 0)
-	    {
-	      fprintf(stderr, "Invalid maximum io submit: %s\n", optarg);
-	      return 1;
-	    }
-	  break;
-	case 'f':
-	  MY_AIO_FLIGHT_MAX = atoi(optarg);
-	  if (MY_AIO_FLIGHT_MAX == 0)
-	    {
-	      fprintf(stderr, "Invalid maximum inflight io: %s\n", optarg);
-	      return 1;
-	    }
-	  break;
-	}
+      case 'd':
+        mydev = strdup(optarg);
+        break;
+      case 's':
+        myiosize = atoi(optarg);
+        if (myiosize == 0)
+        {
+          fprintf(stderr, "Invalid io size: %s\n", optarg);
+          return 1;
+        }
+        myiosize *= 1024;
+        break;
+      case 'w':
+        mode_write = 1;
+        break;
+      case 'c':
+        mycount = atoll(optarg);
+        if (mycount == 0)
+        {
+          fprintf(stderr, "Invalid io count: %s\n", optarg);
+          return 1;
+        }
+        break;
+      case 'r':
+        mode_rnd = 1;
+        break;
+      case 'b':
+        maxsubmit = atoi(optarg);
+        if (maxsubmit == 0)
+        {
+          fprintf(stderr, "Invalid maximum io submit: %s\n", optarg);
+          return 1;
+        }
+        break;
+      case 'f':
+        maxinflight = atoi(optarg);
+        if (maxinflight == 0)
+        {
+          fprintf(stderr, "Invalid maximum inflight io: %s\n", optarg);
+          return 1;
+        }
+        break;
+      case 'v':
+        opt_verbose += 1;
+        break;
+      case 'n':
+        myruns = atoi(optarg);
+        if (myruns == 0)
+        {
+          fprintf(stderr, "Invalid maximum runs: %s\n", optarg);
+          return 1;
+        }
+        break;
     }
+  }
   return 0;
 }
 
 int usage(char *s)
 {
-  fprintf(stderr, "Usage: %s <--dev=/dev/xxx> [--write] [--iosize=x (kB)] [--iocount=x] [--random] [--maxsubmit=x] [--maxinflight=x]\n", s);
+  fprintf(stderr, "Usage: %s <--dev=/dev/xxx> [--write] [--random] \
+[--iosize=x (kB)] [--iocount=x] [--runs=x] [--verbose] \
+[--maxsubmit=x] [--maxinflight=x]\n", s);
   return 2;
+}
+
+/*
+ * variance-related functions
+ * http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+ */
+
+void init_variance(variance_t *variance)
+{
+  variance->n = 0;
+  variance->mean = 0;
+  variance->m2 = 0;
+}
+
+void update_variance(variance_t *variance, double value)
+{
+  double delta;
+
+  variance->n += 1;
+  delta = value - variance->mean;
+  variance->mean = variance->mean + delta / variance->n;
+  variance->m2 = variance->m2 + delta * (value - variance->mean);
+}
+
+double get_variance(const variance_t *variance)
+{
+  return variance->m2 / (variance->n - 1);
+}
+
+double get_stddev(const variance_t *variance)
+{
+  return sqrt(get_variance(variance));
+}
+
+void update_minmax(const double *cur, double *min, double *max)
+{
+    if (*cur < *min)
+      *min = *cur;
+    else if (*cur > *max)
+      *max = *cur;
 }
 
 int main(int argc, char **argv)
 {
+  struct timeval tv_start, tv_end;
+  unsigned int elapsed;
+  unsigned int stat_time = 0, stat_iocount = 0;
+  double lat_cur, lat_min = DBL_MAX, lat_max = 0;
+  double bw_cur, bw_min = DBL_MAX, bw_max = 0;
+  double iops_cur, iops_min = DBL_MAX, iops_max = 0;
+  variance_t lat_variance, bw_variance, iops_variance;
+
   if (main_getopt(argc, argv))
     return 1;
 
   if (!mydev)
     return usage(argv[0]);
 
+  /* CPU affinity selection */
   cpu_set_t mask;
-
   CPU_ZERO(&mask);
   CPU_SET(0, &mask);
   sched_setaffinity(0, sizeof(mask), &mask);
 
-  //printf("sizeof 8 bytes type : %lu\n", sizeof(long long int));
+  /* opening device */
+  printf("Using device: %s\n", mydev);
   int fd = open(mydev, O_RDWR | O_DIRECT);
   if (fd < 0)
     err(1, "open %s", mydev);
-  /* fd = get_raw(fd); */
+
+  /* detecting device size */
   ioctl(fd, BLKGETSIZE64, &mydevsize);
-  /* mydevsize = 262144000000; */
-  printf("Device size : %llu\n", mydevsize);
+  printf("Device size: %llu\n", mydevsize);
+
+  /* detecting optimal io size */
   if (!myiosize)
+  {
+    ioctl(fd, BLKIOOPT, &myiosize);
+
+    if (!myiosize)
     {
-      ioctl(fd, BLKIOOPT, &myiosize);
-      if (!myiosize)
-	{
-	  fprintf(stderr, "Please specify IO size\n");
-	  return 1;
-	}
-      else
-	printf("Using auto-detected optimal_io_size for %s\n", mydev);
+      fprintf(stderr, "Please specify IO size\n");
+      return 1;
     }
-  //myiosize = 4096;
-  //myiosize = 4096;
-  /* myiosize = 8 * 1024; */
-  //  myiosize = 16 * 1024;
-  //  myiosize = 32 * 1024;
-  //   myiosize = 64 * 1024;
-  //myiosize = 128 * 1024;
-  //myiosize = 4 * 128 * 1024;
-  // myiosize = 256 * 1024;
-  /* myiosize = 512 * 1024; */
-  /* myiosize = 5 * 256 * 1024; */
-//  myiosize = 7 * 256 * 1024;
-  /* myiosize = 851968; */
-  /* myiosize = 1048576; */
-  /* myiosize = 13 * 1024 * 32; */
-  /* myiosize = 256 * 5 * 1024; */
-  printf("Using device %s\n", mydev);
-  printf("Performing %s%s test\n", mode_rnd ? "random " : "",  mode_write ? "write" : "read");
-  printf("Will perform %llux %lukB IOs\n", mycount, (long unsigned int)(myiosize / 1024));
-  printf("Maximum IO submit / inflight: %d / %d\n", MY_AIO_SUBMIT_MAX, MY_AIO_FLIGHT_MAX);
-  //mycount = mydevsize / myiosize;
-  posix_fadvise(fd, 0, mydevsize, POSIX_FADV_RANDOM);
-  void *addr = mmap(NULL, myiosize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (!addr)
+    else
+      printf("Using auto-detected optimal_io_size for %s\n", mydev);
+  }
+
+  printf("Performing %s %s test, %d runs\n",
+    mode_rnd ? "random " : "sequential",
+    mode_write ? "write" : "read", myruns);
+  printf("Will perform %u x %u x %ukB IOs\n",
+    myruns, mycount, myiosize / 1024);
+  printf("Maximum IO submit / inflight: %d / %d\n",
+    maxsubmit, maxinflight);
+
+  /* advising kernel of future io pattern */
+  if (mode_rnd)
+    posix_fadvise(fd, 0, mydevsize, POSIX_FADV_RANDOM);
+  else
+    posix_fadvise(fd, 0, mydevsize, POSIX_FADV_SEQUENTIAL);
+
+  /* initialize a buffer with random data for disk writes */
+  void *buf = mmap(NULL, myiosize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (!buf)
     err(1, "mmap");
-  int i;
-  /* if ((unsigned long)addr % 512 || (unsigned long)addr % 4096) */
-  if ((uintptr_t)addr % 512 || (uintptr_t)addr % 4096)
+  if ((uintptr_t)buf % 512 || (uintptr_t)buf % 4096)
     errx(1, "mmap is not aligned...");
-  //printf("initialize buffer\n");
-  for (i = 0; i < myiosize; ++i)
+  int i;
+  for (i = 0; i < myiosize / sizeof(int); ++i)
+    ((int *)buf)[i] = rand();
+
+  init_variance(&lat_variance);
+  init_variance(&bw_variance);
+  init_variance(&iops_variance);
+
+  /* start X runs and collect stats */
+  for (runid = 0; runid < myruns; ++runid)
+  {
+    gettimeofday(&tv_start, NULL);
+    loop_aio(fd, buf);
+    gettimeofday(&tv_end, NULL);
+
+    /* update stats */
+    elapsed = (tv_end.tv_sec - tv_start.tv_sec) * 1000 + (tv_end.tv_usec - tv_start.tv_usec) / 1000;
+
+    stat_time += elapsed;
+    stat_iocount += mycount;
+
+    lat_cur = (double)elapsed / mycount;
+    bw_cur = (double)myiosize * mycount / elapsed * 1000 / (1024 * 1024);
+    iops_cur = (double)mycount / elapsed * 1000;
+
+    update_minmax(&lat_cur, &lat_min, &lat_max);
+    update_minmax(&bw_cur, &bw_min, &bw_max);
+    update_minmax(&iops_cur, &iops_min, &iops_max);
+
+    update_variance(&lat_variance, lat_cur);
+    update_variance(&bw_variance, bw_cur);
+    update_variance(&iops_variance, iops_cur);
+
+    if (opt_verbose)
     {
-      ((unsigned char *)addr)[i] = rand();
+      printf("[run %d] done in %d ms\n", runid, stat_time);
+      printf("[run %d] iop/s: %.3lf\n", runid, iops_cur);
+      printf("[run %d] avg bandwidth: %.3lf MB/s\n", runid, bw_cur);
+      printf("[run %d] avg latency: %.3lf ms\n", runid, lat_cur);
     }
-  //printf("loop\n");
-  /* loop_write(fd, addr); */
-  loop_aio(fd, addr);
+  }
+
+  printf("all jobs done in %d ms\n", stat_time);
+  printf("total data size: %lld MB\n",
+    (unsigned long long)myiosize * stat_iocount / 1024 / 1024);
+  printf("total %s io: %u\n", mode_write ? "write" : "read", stat_iocount);
+  printf("average iop/s: %.2lf (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
+    (double)stat_iocount / stat_time * 1000,
+    iops_min, iops_max, get_stddev(&iops_variance));
+  printf("average latency: %.3lf ms (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
+    (double)stat_time / stat_iocount, lat_min, lat_max,
+    get_stddev(&lat_variance));
+  printf("average bandwidth: %.3lf MB/s %.3lf Mb/s) (min/max/stddev=%.2lf/%.2lf/%.2lf)\n",
+    (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024),
+    (double)myiosize * stat_iocount / stat_time * 1000 / (1024 * 1024) * 8,
+    bw_min, bw_max, get_stddev(&bw_variance));
+
+  return 0;
 }
