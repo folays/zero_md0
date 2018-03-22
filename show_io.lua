@@ -67,6 +67,9 @@ print(ireq, idone)
 if (ireq ~= idone) then print("\027[33mWARNING\027[0m: iorequest_cnt != iodone_cnt") end
 ireq = idone
 
+util_1s_uptime, util_1s_time, util_1s = get_file_sums("/proc/uptime"), get_file_sums("/sys/block/BLOCKDEV/stat", {10}), -1
+util_5s_uptime, util_5s_time, util_5s = util_1s_uptime, util_1s_time, util_1s
+
 while (true) do
   local aio_nr = get_file_contents("/proc/sys/fs/aio-nr")
   local req = get_file_sums("/sys/block/BLOCKDEV/../../iorequest_cnt") - ireq
@@ -80,12 +83,26 @@ while (true) do
     stripe_cache = string.format(" (stripe_cache %.02f%%)", stripe_cache_active / stripe_cache_size * 100)
   end
 
-  print(string.format("submitted [%d] done/request/queued [%06d/%06d/%04d] (queued/queue_depth %.02f%%) (inflight %04d) (inflight/nr_request %.02f%%)%s",
+  local util_uptime = get_file_sums("/proc/uptime")
+  local util_time = get_file_sums("/sys/block/BLOCKDEV/stat", {10})
+  if (util_uptime - util_1s_uptime > 1) then
+     util_1s = (util_time - util_1s_time) / (util_uptime - util_1s_uptime) / 10
+     util_1s_uptime = util_uptime
+     util_1s_time = util_time
+  end
+  if (util_uptime - util_5s_uptime > 5) then
+     util_5s = (util_time - util_5s_time) / (util_uptime - util_5s_uptime) / 10
+     util_5s_uptime = util_uptime
+     util_5s_time = util_time
+  end
+
+  print(string.format("submitted [%d] done/request/queued [%06d/%06d/%04d] (queued/queue_depth %.02f%%) (inflight %04d) (inflight/nr_request %.02f%%)%s (%%util 1s/5s %.02f/%.02f)",
 	aio_nr,
 	done, req, req - done,
 	(req - done) / queue_depth * 100,
 	inflight,
 	inflight / nr_requests * 100,
-	stripe_cache))
+	stripe_cache,
+	util_1s, util_5s))
   folays.usleep(100000)
 end
