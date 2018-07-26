@@ -57,6 +57,7 @@
 
 static char *mydev = 0; /* device to be used */
 static unsigned int mode_write = 0; /* 0 => read, 1 => write */
+static unsigned int mode_sync = 0; /* 0 => [], 1 => O_SYNC */
 static unsigned int mode_rnd = 0; /* 0 => sequential, 1 => random */
 static unsigned long long int mydevsize; /* size of the block device in bytes */
 static int myiosize = 0; /* io size */
@@ -160,6 +161,9 @@ void loop_aio(int fd, void *buf)
     /* if there are available slots for submitting queries, do it */
     if (tosubmit)
     {
+      if (opt_verbose > 1)
+	printf("io_submit: inflight [%u/%u] copied [%u/%u] tosubmit [%d]\n",
+	       inflight, maxinflight, copied, mycount, tosubmit);
       /* submit io and check elapsed time */
       gettimeofday(&tv1, NULL);
       if ((res = io_submit(myctx, tosubmit, ioq)) != tosubmit)
@@ -199,12 +203,13 @@ static struct option long_options[] = {
   {"dev", required_argument, NULL, 'd'},
   {"iosize", required_argument, NULL, 's'},
   {"write", no_argument, NULL, 'w'},
+  {"sync", no_argument, NULL, 'y'},
   {"random", no_argument, NULL, 'r'},
   {"iocount", required_argument, NULL, 'c'},
   {"maxsubmit", required_argument, NULL, 'b'},
   {"maxinflight", required_argument, NULL, 'f'},
   {"runs", required_argument, NULL, 'n'},
-  {"verbose", no_argument, NULL, 'v'},
+  {"verbose", optional_argument, NULL, 'v'},
   {NULL, 0, NULL, 0},
 };
 
@@ -212,7 +217,7 @@ int main_getopt(int argc, char **argv)
 {
   int c;
 
-  while ((c = getopt_long(argc, argv, "d:s:wrc:b:f:n:v", long_options, NULL)) != -1)
+  while ((c = getopt_long(argc, argv, "d:s:wyrc:b:f:n:v::", long_options, NULL)) != -1)
   {
     switch (c)
     {
@@ -230,6 +235,9 @@ int main_getopt(int argc, char **argv)
         break;
       case 'w':
         mode_write = 1;
+        break;
+      case 'y':
+        mode_sync = 1;
         break;
       case 'c':
         mycount = atoll(optarg);
@@ -346,7 +354,7 @@ int main(int argc, char **argv)
 
   /* opening device */
   printf("Using device: %s\n", mydev);
-  int fd = open(mydev, O_RDWR | O_DIRECT);
+  int fd = open(mydev, O_RDWR | O_DIRECT | (mode_sync ? O_SYNC : 0));
   if (fd < 0)
     err(1, "open %s", mydev);
 
@@ -368,13 +376,16 @@ int main(int argc, char **argv)
       printf("Using auto-detected optimal_io_size for %s\n", mydev);
   }
 
-  printf("Performing %s %s test, %d runs\n",
+  printf("Performing %s %s %s test, %d runs\n",
     mode_rnd ? "random " : "sequential",
-    mode_write ? "write" : "read", myruns);
+    mode_write ? "write" : "read",
+    mode_sync ? "sync" : "nosync",
+    myruns);
   printf("Will perform %u x %u x %ukB IOs\n",
     myruns, mycount, myiosize / 1024);
   printf("Maximum IO submit / inflight: %d / %d\n",
     maxsubmit, maxinflight);
+  printf("Verbosity : %d\n", opt_verbose);
 
   /* advising kernel of future io pattern */
   if (mode_rnd)
